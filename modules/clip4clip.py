@@ -245,6 +245,75 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
 
         self.loss_fct = CrossEn()
         
+    def forward_direction(self, input_ids, token_type_ids, attention_mask, video, video_mask, labels=None):
+        output_dict = {}
+
+        # -------------------------
+        # TEXT (9 classes)
+        # -------------------------
+        num_classes = input_ids.size(0)
+
+        unified_text_prompt, _ = self.clip.encode_prompt(
+            num_classes,
+            device=input_ids.device
+        )
+
+        input_ids = input_ids.view(-1, input_ids.shape[-1])
+        token_type_ids = token_type_ids.view(-1, token_type_ids.shape[-1])
+        attention_mask = attention_mask.view(-1, attention_mask.shape[-1])
+
+        sequence_output = self.get_sequence_output(
+            input_ids,
+            unified_text_prompt,
+            token_type_ids,
+            attention_mask
+        )  # [9, 1, D]
+
+        # -------------------------
+        # VIDEO (B samples)
+        # -------------------------
+        video = torch.as_tensor(video).float()
+
+        if video.dim() == 5:
+            video = video.unsqueeze(1)
+
+        batch_size, pair, video_frame, channel, h, w = video.shape
+
+        _, unified_visual_prompt = self.clip.encode_prompt(
+            batch_size,
+            device=video.device
+        )
+
+        video_mask = video_mask.view(-1, video_mask.shape[-1])
+
+        visual_output = self.get_visual_output(
+            video,
+            unified_visual_prompt,
+            video_mask,
+            video_frame=video_frame
+        )  # [B, 1, D]
+
+        # -------------------------
+        # SIMILARITY
+        # -------------------------
+        logits_t2v, *_ = self.get_similarity_logits(
+            sequence_output,
+            visual_output,
+            attention_mask,
+            video_mask,
+            shaped=False
+        )
+
+        logits = logits_t2v.t()  # [B, 9]
+
+        output_dict["logits"] = logits
+
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+            output_dict["loss"] = loss
+            output_dict["sim_loss"] = loss
+
+        return output_dict
 
     def forward(self, input_ids=None, token_type_ids=None, attention_mask=None, video=None, video_mask=None,
                     pre_visual_pooling=False):
@@ -486,16 +555,93 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
             sequence_output = all_gather(sequence_output)
             torch.distributed.barrier() 
 
+        # ---------------- visual ----------------
         if self.training or not self.pre_visual_pooling:
-            visual_output = visual_output.squeeze(1)
-            visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+            visual_output = visual_output.squeeze(1)   # [B, D]
 
-        sequence_output = sequence_output.squeeze(1)
-        sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+            if torch.isnan(visual_output).any() or torch.isinf(visual_output).any():
+                print("[DEBUG] visual_output broken before norm")
+                bad_visual_rows = torch.isnan(visual_output).any(dim=1) | torch.isinf(visual_output).any(dim=1)
+                print("[DEBUG] bad visual rows:", bad_visual_rows.nonzero(as_tuple=True)[0])
 
+            visual_norm = visual_output.norm(dim=-1, keepdim=True)   # [B, 1]
+            print("[DEBUG] visual_norm:", visual_norm.squeeze(-1))
+
+            zero_visual = (visual_norm.squeeze(-1) == 0)
+            if zero_visual.any():
+                print("[DEBUG] zero visual norm rows:", zero_visual.nonzero(as_tuple=True)[0])
+
+            visual_output = visual_output / (visual_norm + 1e-6)
+
+            if torch.isnan(visual_output).any() or torch.isinf(visual_output).any():
+                print("[DEBUG] visual_output broken after norm")
+                bad_visual_rows = torch.isnan(visual_output).any(dim=1) | torch.isinf(visual_output).any(dim=1)
+                print("[DEBUG] bad visual rows after norm:", bad_visual_rows.nonzero(as_tuple=True)[0])
+
+        # ---------------- text ----------------
+        if torch.isnan(sequence_output).any() or torch.isinf(sequence_output).any():
+            print("[DEBUG] sequence_output broken before squeeze")
+
+        sequence_output = sequence_output.squeeze(1)   # [B, D]
+
+        if torch.isnan(sequence_output).any() or torch.isinf(sequence_output).any():
+            print("[DEBUG] sequence_output broken before norm")
+            bad_text_rows = torch.isnan(sequence_output).any(dim=1) | torch.isinf(sequence_output).any(dim=1)
+            print("[DEBUG] bad text rows:", bad_text_rows.nonzero(as_tuple=True)[0])
+
+        text_norm = sequence_output.norm(dim=-1, keepdim=True)   # [B, 1]
+        print("[DEBUG] text_norm:", text_norm.squeeze(-1))
+
+        zero_text = (text_norm.squeeze(-1) == 0)
+        if zero_text.any():
+            print("[DEBUG] zero text norm rows:", zero_text.nonzero(as_tuple=True)[0])
+
+        sequence_output = sequence_output / (text_norm + 1e-6)
+
+        if torch.isnan(sequence_output).any() or torch.isinf(sequence_output).any():
+            print("[DEBUG] sequence_output broken after norm")
+            bad_text_rows = torch.isnan(sequence_output).any(dim=1) | torch.isinf(sequence_output).any(dim=1)
+            print("[DEBUG] bad text rows after norm:", bad_text_rows.nonzero(as_tuple=True)[0])
+
+        # ---------------- similarity ----------------
         logit_scale = self.clip.logit_scale.exp()
         retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
+
+        if torch.isnan(retrieve_logits).any() or torch.isinf(retrieve_logits).any():
+            print("[DEBUG] retrieve_logits broken")
+            print("[DEBUG] logit_scale:", logit_scale.item())
+            print("[DEBUG] visual_norm min:", visual_norm.min().item())
+            print("[DEBUG] text_norm min:", text_norm.min().item())
+
+            bad_rows = torch.isnan(retrieve_logits).any(dim=1) | torch.isinf(retrieve_logits).any(dim=1)
+            bad_cols = torch.isnan(retrieve_logits).any(dim=0) | torch.isinf(retrieve_logits).any(dim=0)
+
+            print("[DEBUG] bad retrieve row idx:", bad_rows.nonzero(as_tuple=True)[0])
+            print("[DEBUG] bad retrieve col idx:", bad_cols.nonzero(as_tuple=True)[0])
+
         return retrieve_logits
+        # if self.training or not self.pre_visual_pooling:
+        #     visual_output = visual_output.squeeze(1)
+        #     #visual_output = visual_output / visual_output.norm(dim=-1, keepdim=True)
+        #     visual_norm = visual_output.norm(dim=-1, keepdim=True) #추가
+        #     if torch.isnan(visual_output).any() or torch.isinf(visual_output).any():
+        #         print("[DEBUG] visual_output broken before norm")
+        #     if (visual_norm == 0).any():
+        #         print("[DEBUG] zero visual norm detected")
+        #     visual_output = visual_output / (visual_norm + 1e-6) #추가
+
+        # sequence_output = sequence_output.squeeze(1)
+        # #sequence_output = sequence_output / sequence_output.norm(dim=-1, keepdim=True)
+        # text_norm = sequence_output.norm(dim=-1, keepdim=True) #추가
+        # if torch.isnan(sequence_output).any() or torch.isinf(sequence_output).any():
+        #     print("[DEBUG] sequence_output broken before norm")
+        # if (text_norm == 0).any():
+        #     print("[DEBUG] zero text norm detected")
+        # sequence_output = sequence_output / (text_norm + 1e-6) #추가
+
+        # logit_scale = self.clip.logit_scale.exp()
+        # retrieve_logits = logit_scale * torch.matmul(sequence_output, visual_output.t())
+        # return retrieve_logits
 
     def _cross_similarity(self, sequence_output, visual_output, attention_mask, video_mask):
         sequence_output, visual_output = sequence_output.contiguous(), visual_output.contiguous()

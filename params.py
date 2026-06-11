@@ -220,8 +220,14 @@ def get_args(description='DGL on Retrieval Task'):
                             help="The choice of visual output for abalation")
     
     parser.add_argument('--temporal_prompt', type=str, default="DGL")
-    
-    
+    parser.add_argument("--num_classes", type=int, default=9)
+
+    parser.add_argument("--use_traj_prompt", type=int, default=0)
+    parser.add_argument("--traj_prompt_scale", type=float, default=0.005)
+    parser.add_argument("--traj_prompt_dropout", type=float, default=0.0)
+    parser.add_argument("--traj_feat_type", type=str, default="patch_mean",
+                        choices=["cls", "patch_mean"])
+        
     args = parser.parse_args()
 
     args = parser.parse_args()

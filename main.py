@@ -13,7 +13,7 @@ from torch import optim, distributed
 # from torch.cuda.amp import GradScaler
 from torch.amp import GradScaler
 from torch.utils.tensorboard import SummaryWriter
-
+import csv
 from params import get_args, save_hp_to_json
 from modules import CLIP4Clip, convert_weights
 from modules import SimpleTokenizer as ClipTokenizer
@@ -25,8 +25,93 @@ from utils.log import setup_primary_logging, setup_worker_logging
 from utils.misc import set_random_seed, convert_models_to_fp32, save_checkpoint
 from utils.dist_utils import is_master, get_rank, is_dist_avail_and_initialized, init_distributed_mode
 from utils.metrics import compute_metrics, tensor_text_to_video_metrics, tensor_video_to_text_sim
-
+from modules.clip import force_flush_debug_buffer
 best_R1 = 0
+ 
+
+DEBUG_REPLAY_ONLY = True
+
+def save_last_checkpoint(model, optimizer, scaler, epoch, global_step,
+                         best_R1, model_dir, filename='ckpt.pth.tar'):
+    """
+    항상 마지막 학습 상태를 저장하는 checkpoint
+    eval 전에 무조건 저장하는 용도
+    기존 save_checkpoint 스타일과 동일하게 동작
+    """
+
+    state = {
+        'epoch': epoch + 1,
+        'global_step': global_step,
+        'arch': 'CLIp4Clip',
+        'state_dict': model.state_dict(),
+        'best_acc1': best_R1,
+        'optimizer': optimizer.state_dict(),
+    }
+
+    if scaler is not None:
+        state['scaler'] = scaler.state_dict()
+
+    filepath = os.path.join(model_dir, filename)
+
+    torch.save(state, filepath)
+
+    logging.info(f"[checkpoint] Saved LAST checkpoint to {filepath}")
+
+def get_debug_model(model):
+    return model.module if hasattr(model, "module") else model
+
+def get_traj_debug_stats(model):
+
+    m = get_debug_model(model)
+
+    stats = {}
+
+    try:
+        visual = m.clip.visual
+
+        if hasattr(visual, "last_prompt_stats"):
+            stats.update(visual.last_prompt_stats)
+
+        tp = visual.TemporalPrompt
+
+        if hasattr(tp, "last_traj_stats"):
+            stats.update(tp.last_traj_stats)
+
+    except Exception as e:
+        stats["debug_error"] = str(e)
+
+    return stats
+
+def summarize_direction_logits(logits, labels, num_classes):
+
+    with torch.no_grad():
+
+        probs = torch.softmax(logits.detach().float(), dim=-1)
+
+        preds = torch.argmax(logits, dim=-1)
+
+        pred_counts = torch.bincount(
+            preds.cpu(),
+            minlength=num_classes
+        ).float()
+
+        pred_ratio = (
+            pred_counts /
+            pred_counts.sum().clamp(min=1)
+        )
+
+        entropy = -(
+            probs * torch.log(probs + 1e-12)
+        ).sum(dim=-1).mean().item()
+
+        return {
+            "entropy": entropy,
+            "pred_ratio": pred_ratio.tolist(),
+            "avg_logits":
+                logits.detach().float().mean(dim=0).cpu().tolist(),
+            "batch_acc":
+                (preds == labels).float().mean().item(),
+        }
 
 def main(args):
     """main function"""
@@ -68,12 +153,10 @@ def main(args):
             args.world_size = 1
         main_worker(args.gpu, None, log_queue, args)
 
-
 def main_worker(gpu, ngpus_per_node, log_queue, args):
     """main worker"""
     global best_R1
     args.gpu = gpu
-
 
     ## ####################################
     # initilization
@@ -87,7 +170,6 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
     # save parameters
     if is_master(): save_hp_to_json(args.output_dir, args)
 
-
     ## ####################################
     # create model
     ## ####################################
@@ -100,14 +182,17 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
                                         cache_dir=cache_dir,
                                         state_dict=model_state_dict,
                                         task_config=args)
-   
+    if is_master():
+        logging.info(f"[traj_prompt] use_traj_prompt = {args.use_traj_prompt}")
+        logging.info(f"[traj_prompt] traj_prompt_scale = {args.traj_prompt_scale}")
+        logging.info(f"[traj_prompt] traj_feat_type = {args.traj_feat_type}")
     #model.freeze_cip_layers(args.freeze_layer_num)
     
     #logging.info('\nweight from DeepCluster')
      
 
     # See https://discuss.pytorch.org/t/valueerror-attemting-to-unscale-fp16-gradients/81372
-    if args.precision == "amp"or args.gpu is None:  	# or args.precision == "fp32" 
+    if args.precision in ["amp", "fp32"]or args.gpu is None:  	# or args.precision == "fp32" 
         logging.info("[weight convert] ==>> Convert weights to fp32 for {}...".format(args.precision))
         convert_models_to_fp32(model)
         logging.info("[weight convert] ==>> Convert done!")
@@ -133,7 +218,6 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
             model = torch.nn.DataParallel(model, device_ids=args.multigpu)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu", get_rank() % ngpus_per_node)
 
-
     ## ####################################
     # dataloader loading
     ## ####################################
@@ -157,7 +241,6 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
     train_dataloader, train_length, train_sampler = DATALOADER_DICT[args.datatype]["train"](args, tokenizer)
     num_train_optimization_steps = (int(len(train_dataloader) + args.gradient_accumulation_steps - 1)
                                     / args.gradient_accumulation_steps) * args.epochs
-
 
     ## ####################################
     # optimization strategies
@@ -217,7 +300,6 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
         else:
             logging.info("[resume] => no checkpoint found at '{}'\n".format(args.resume))
 
-
     ## ####################################
     # train and evalution
     ## ####################################
@@ -257,7 +339,21 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
 
         if is_master():
             logging.info("Epoch %d/%s Finished, Train Loss: %f", epoch + 1, args.epochs, tr_loss)
-
+            
+            #CKPT 저장
+            save_last_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                epoch=epoch,
+                global_step=global_step,
+                best_R1=best_R1,
+                model_dir=args.output_dir,
+                filename="ckpt.pth.tar"
+            )
+            logging.info("[checkpoint] Saved last checkpoint before evaluation.")
+            #요기까지
+            
             # Run on val dataset, this process is *TIME-consuming*.
             R1, infer_epoch_time, info_str = eval_epoch(model, test_dataloader, device, args=args, epoch=epoch)
             eval_infer_times.append(infer_epoch_time)
@@ -294,7 +390,6 @@ def main_worker(gpu, ngpus_per_node, log_queue, args):
     torch.cuda.empty_cache()
     sys.exit(0)
 
-
 def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_step,
                 scheduler=None, scaler=None, tf_writer=None):
     samples_per_epoch = len(train_dataloader.dataset)
@@ -320,11 +415,13 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
         # logging.info("Trainable param percentage are: {}".format(percentage))
         # logging.info("Trainable params are: {} MB, Total params are: {} MB".format(trainable_size_MB,total_param_size_MB))
 
-
     total_loss = 0
 
     end = time.time()
-
+    if args.datatype == "direction_mcq":
+        loss_name = "ClsLoss"
+    else:
+        loss_name = "SimLoss"
     for step, batch in enumerate(train_dataloader):
         # if step == 1:
         #     break
@@ -333,24 +430,173 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
         optimizer.zero_grad()
         if scheduler is not None: scheduler(optimizer, global_step=global_step)
         # multi-gpu does scattering it-self
-        if torch.cuda.is_available():
-            batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
-        input_ids, input_mask, segment_ids, video, video_mask = batch
-        data_time = time.time() - end
-        
-        # logging.info(f"Step: {step}   input_ids: {input_ids}")
-        # logging.info(f"Step: {step}   input_mask: {input_mask}")
-        # logging.info(f"Step: {step}   segment_ids: {segment_ids}")
-        # logging.info(f"Step: {step}   video: {video}")
-        # logging.info(f"Step: {step}   video_mask: {video_mask}")
+#여기서부터
+        # if torch.cuda.is_available():
+        #     batch = tuple(t.to(device=device, non_blocking=True) for t in batch)
 
-        # forward
-        # with torch.cuda.amp.autocast(enabled=scaler is not None):
-        with torch.amp.autocast('cuda', enabled=scaler is not None):
-            output = model(input_ids, segment_ids, input_mask, video, video_mask)
-            loss = output['loss'].mean()
-            #cluster_loss = output['cluster_loss'].mean()
-            sim_loss = output['sim_loss'].mean()
+        # input_ids, input_mask, segment_ids, video, video_mask = batch
+        # data_time = time.time() - end
+        
+        # # logging.info(f"Step: {step}   input_ids: {input_ids}")
+        # # logging.info(f"Step: {step}   input_mask: {input_mask}")
+        # # logging.info(f"Step: {step}   segment_ids: {segment_ids}")
+        # # logging.info(f"Step: {step}   video: {video}")
+        # # logging.info(f"Step: {step}   video_mask: {video_mask}")
+
+        # # forward
+        # # with torch.cuda.amp.autocast(enabled=scaler is not None):
+        # with torch.amp.autocast('cuda', enabled=scaler is not None):
+        #     output = model(input_ids, segment_ids, input_mask, video, video_mask)
+        #     loss = output['loss'].mean()
+        #     #cluster_loss = output['cluster_loss'].mean()
+        #     sim_loss = output['sim_loss'].mean()
+#여기까지
+
+        # 새로 추가: 문자열 metadata 분리
+        if args.datatype == "direction_mcq":
+            (
+                input_ids,
+                input_mask,
+                segment_ids,
+                video,
+                video_mask,
+                labels,
+                sample_ids,
+                qa_types,
+                answer_texts,
+                questions,
+                debug_video_paths,
+            ) = batch
+
+            if torch.cuda.is_available():
+                input_ids = input_ids.to(device=device, non_blocking=True)
+                input_mask = input_mask.to(device=device, non_blocking=True)
+                segment_ids = segment_ids.to(device=device, non_blocking=True)
+                video = video.to(device=device, non_blocking=True)
+                video_mask = video_mask.to(device=device, non_blocking=True)
+                labels = labels.to(device=device, non_blocking=True).long()
+
+            # class text는 모든 sample마다 동일하므로 첫 번째 것만 사용
+            input_ids = input_ids[0]          # [9, max_words]
+            input_mask = input_mask[0]        # [9, max_words]
+            segment_ids = segment_ids[0]      # [9, max_words]
+
+            # video는 [B, 1, T, C, H, W] 형태 그대로 둬도 기존 코드와 맞을 가능성이 큼
+            if step == 0 and is_master():
+                print("[DEBUG] input_ids:", input_ids.shape)
+                print("[DEBUG] video:", video.shape)
+                print("[DEBUG] video_mask:", video_mask.shape)
+                print("[DEBUG] labels:", labels.shape)
+            # 만약 shape 에러가 나면 그때 video.squeeze(1)을 시도
+            # video = video.squeeze(1)
+            # video_mask = video_mask.squeeze(1)
+            data_time = time.time() - end
+
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
+                output = (
+                    model.module.forward_direction(
+                        input_ids,
+                        segment_ids,
+                        input_mask,
+                        video,
+                        video_mask,
+                        labels
+                    )
+                    if hasattr(model, "module")
+                    else model.forward_direction(
+                        input_ids,
+                        segment_ids,
+                        input_mask,
+                        video,
+                        video_mask,
+                        labels
+                    )
+                )
+
+                logits = output["logits"]      # [B, 9]
+                if (
+                    args.datatype == "direction_mcq"
+                    and is_master()
+                    and global_step % 500 == 0
+                ):
+
+                    log_stats = summarize_direction_logits(
+                        logits,
+                        labels,
+                        args.num_classes
+                    )
+
+                    traj_stats = get_traj_debug_stats(model)
+
+                    logging.info(
+                        "[collapse_debug] "
+                        f"epoch={epoch} "
+                        f"step={step} "
+                        f"global_step={global_step} "
+
+                        f"batch_acc={log_stats['batch_acc']:.4f} "
+                        f"entropy={log_stats['entropy']:.4f} "
+
+                        f"pred_ratio={log_stats['pred_ratio']} "
+
+                        f"avg_logits={log_stats['avg_logits']} "
+
+                        f"traj_stats={traj_stats}"
+                    )
+
+                loss = output["loss"]
+                sim_loss = output["sim_loss"]
+
+                if logits.shape[0] != labels.shape[0] or logits.shape[1] != args.num_classes:
+                    raise RuntimeError(
+                        f"Bad logits shape: logits={logits.shape}, "
+                        f"labels={labels.shape}, num_classes={args.num_classes}"
+                    )
+
+        else:
+            input_ids, input_mask, segment_ids, video, video_mask, video_ids, video_paths = batch
+            
+            if torch.cuda.is_available():
+                input_ids = input_ids.to(device=device, non_blocking=True)
+                input_mask = input_mask.to(device=device, non_blocking=True)
+                segment_ids = segment_ids.to(device=device, non_blocking=True)
+                video = video.to(device=device, non_blocking=True)
+                video_mask = video_mask.to(device=device, non_blocking=True)
+
+            data_time = time.time() - end
+
+            with torch.amp.autocast('cuda', enabled=scaler is not None):
+                output = model(input_ids, segment_ids, input_mask, video, video_mask)
+                #추가 디버깅
+                if torch.isnan(output["loss"]).any() or torch.isinf(output["loss"]).any():
+                    print("[DEBUG] loss broken")
+                if torch.isnan(output["sim_loss"]).any() or torch.isinf(output["sim_loss"]).any():
+                    print("[DEBUG] sim_loss broken")
+                #여기까지
+                loss = output['loss'].mean()
+                sim_loss = output['sim_loss'].mean()
+
+        # NaN 첫 발생 디버깅
+        if torch.isnan(loss) or torch.isnan(sim_loss) or torch.isinf(loss) or torch.isinf(sim_loss):
+            print("\n[DEBUG] NaN/Inf detected!")
+            print(f"[DEBUG] epoch={epoch}, step={step}, global_step={global_step}")
+            print(f"[DEBUG] video shape={video.shape}")
+            print(f"[DEBUG] video_mask sum per sample={video_mask.sum(dim=-1)}")
+
+            print(f"[DEBUG] input video has nan: {torch.isnan(video).any().item()}")
+            print(f"[DEBUG] input video has inf: {torch.isinf(video).any().item()}")
+
+            flat_video = video.view(video.size(0), -1)
+            print(f"[DEBUG] per-sample video min: {flat_video.min(dim=1).values}")
+            print(f"[DEBUG] per-sample video max: {flat_video.max(dim=1).values}")
+            print(f"[DEBUG] per-sample video mean: {flat_video.mean(dim=1)}")
+
+            force_flush_debug_buffer(
+                header=f"[DEBUG] force flush because loss/sim_loss is NaN/Inf | epoch={epoch}, step={step}, global_step={global_step}"
+            )
+
+            raise RuntimeError("NaN detected in training")
+        #여기까지
 
         if args.gradient_accumulation_steps > 1:
             loss = loss / args.gradient_accumulation_steps
@@ -386,7 +632,12 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
         if (step + 1) % args.gradient_accumulation_steps == 0:
             global_step += 1
             if global_step % args.n_display == 0 and is_master():
-                num_samples = (step + 1) * len(input_ids) * args.world_size
+                if args.datatype == "direction_mcq":
+                    current_batch_size = labels.size(0)
+                else:
+                    current_batch_size = len(input_ids)
+
+                num_samples = (step + 1) * current_batch_size * args.world_size
                 percent_complete = num_samples * 1.0 / samples_per_epoch * 100
                 logit_scale_data = model.module.clip.logit_scale.data if hasattr(model, 'module') \
                                     else model.clip.logit_scale.data
@@ -395,7 +646,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
                 
                 logging.info(
                     f"Epoch: {epoch} [{num_samples} ({percent_complete:.1f}%)]\t"
-                    f"SimLoss: {sim_loss.item():.4f} \t"
+                    f"{loss_name}: {sim_loss.item():.4f} \t"
                     #f"SimLoss: {sim_loss.item():.4f} CLoss {cluster_loss.item():.4f}\t"
                     f"Data (t) {data_time:.3f}\tBatch (t) {batch_time:.3f}"
                     f"\tLR: {lr_tmp:.1e}\tlogit_scale {logit_scale_data:.3f}"
@@ -420,9 +671,154 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
 
     return total_loss, global_step
 
+def eval_epoch_direction(model, test_dataloader, device, args=None, epoch=0):
+    model.eval()
+
+    total = 0
+    correct = 0
+    infer_start_t = time.time()
+
+    all_preds = []
+    all_labels = []
+    all_qa_types = []
+    all_sample_ids = []
+    all_answer_texts = []
+    all_questions = []
+    all_video_paths = []
+
+    with torch.no_grad():
+        for bid, batch in enumerate(test_dataloader):
+            (
+                input_ids,
+                input_mask,
+                segment_ids,
+                video,
+                video_mask,
+                labels,
+                sample_ids,
+                qa_types,
+                answer_texts,
+                questions,
+                debug_video_paths,
+            ) = batch
+
+            if torch.cuda.is_available():
+                input_ids = input_ids.to(device=device, non_blocking=True)
+                input_mask = input_mask.to(device=device, non_blocking=True)
+                segment_ids = segment_ids.to(device=device, non_blocking=True)
+                video = video.to(device=device, non_blocking=True)
+                video_mask = video_mask.to(device=device, non_blocking=True)
+                labels = labels.to(device=device, non_blocking=True).long()
+
+            input_ids = input_ids[0]
+            input_mask = input_mask[0]
+            segment_ids = segment_ids[0]
+
+            output = (
+                model.module.forward_direction(
+                    input_ids,
+                    segment_ids,
+                    input_mask,
+                    video,
+                    video_mask,
+                    labels=None
+                )
+                if hasattr(model, "module")
+                else model.forward_direction(
+                    input_ids,
+                    segment_ids,
+                    input_mask,
+                    video,
+                    video_mask,
+                    labels=None
+                )
+            )
+
+            logits = output["logits"]
+            preds = torch.argmax(logits, dim=-1)
+            correct += (preds == labels).sum().item()
+            total += labels.size(0)
+
+            all_preds.extend(preds.detach().cpu().tolist())
+            all_labels.extend(labels.detach().cpu().tolist())
+            all_qa_types.extend(list(qa_types))
+            all_sample_ids.extend(list(sample_ids))
+            all_answer_texts.extend(list(answer_texts))
+            all_questions.extend(list(questions))
+            all_video_paths.extend(list(debug_video_paths))
+
+            if (bid + 1) % args.n_display == 0 or (bid + 1) == len(test_dataloader):
+                logging.info("{}/{}\r".format(bid + 1, len(test_dataloader)))
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+    all_infer_time = time.time() - infer_start_t
+    acc = correct * 100.0 / total
+
+    info_str = []
+    info_str.append("Direction Action Recognition:")
+    info_str.append(" (metric) >>> ACC@1: {:.2f}".format(acc))
+    if args.output_dir is not None:
+        csv_path = os.path.join(args.output_dir, f"eval_predictions_epoch{epoch}.csv")
+
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "sample_id",
+                "qa_type",
+                "question",
+                "video_path",
+                "pred_label",
+                "gold_label",
+                "gold_answer_text",
+                "correct",
+            ])
+
+            for sid, qa, q, vp, pred, gold, ans in zip(
+                all_sample_ids,
+                all_qa_types,
+                all_questions,
+                all_video_paths,
+                all_preds,
+                all_labels,
+                all_answer_texts,
+            ):
+                writer.writerow([
+                    sid,
+                    qa,
+                    q,
+                    vp,
+                    pred,
+                    gold,
+                    ans,
+                    int(pred == gold),
+                ])
+
+        logging.info(f"[eval] Saved prediction CSV to {csv_path}")
+
+    # qa_type별 accuracy
+    qa_type_stats = {}
+    for pred, label, qa_type in zip(all_preds, all_labels, all_qa_types):
+        if qa_type not in qa_type_stats:
+            qa_type_stats[qa_type] = [0, 0]
+        qa_type_stats[qa_type][1] += 1
+        if pred == label:
+            qa_type_stats[qa_type][0] += 1
+
+    for qa_type, (c, n) in qa_type_stats.items():
+        qa_acc = c * 100.0 / n
+        info_str.append(f" {qa_type} ACC@1: {qa_acc:.2f} ({c}/{n})")
+
+    for info in info_str:
+        logging.info(info)
+
+    return acc, all_infer_time, info_str
 
 def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
     """evaluation"""
+    if args.datatype == "direction_mcq":
+        return eval_epoch_direction(model, test_dataloader, device, args=args, epoch=epoch)
 
     # #################################################################
     ## below variables are used to multi-sentences retrieval
@@ -527,7 +923,6 @@ def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
         vt_metrics = compute_metrics(sim_matrix.T)
         logging.info('\t Length-T: {}, Length-V:{}'.format(len(sim_matrix), len(sim_matrix[0])))
 
-
     # return for final logging
     info_str = []
     info_str.append("Text-to-Video:")
@@ -541,7 +936,6 @@ def eval_epoch(model, test_dataloader, device, args=None, epoch=0):
     R1 = tv_metrics['R1']
 
     return R1, all_infer_time, info_str
-
 
 def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_list, batch_visual_output_list, args=None):
     """"calculate the similarity between visual output and text output"""
@@ -577,9 +971,7 @@ def _run_on_single_gpu(model, batch_list_t, batch_list_v, batch_sequence_output_
 
     return sim_matrix
 
-
 if __name__ == "__main__":
     args = get_args()
 
     main(args)
-    
