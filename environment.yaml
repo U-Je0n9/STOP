@@ -1,4 +1,4 @@
-name: cuda118
+name: STOP
 channels:
   - pytorch
   - nvidia
@@ -140,4 +140,4 @@ dependencies:
       - tzdata==2024.1
       - wcwidth==0.2.13
       - werkzeug==3.0.3
-prefix: /data/dataset/liuzichen/home/anaconda3/envs/cuda118
+

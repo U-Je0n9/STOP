@@ -230,9 +230,7 @@ def get_args(description='DGL on Retrieval Task'):
         
     args = parser.parse_args()
 
-    args = parser.parse_args()
-
-    assert args.task_type == "retrieval"
+    assert args.task_type in ["retrieval", "direction_mcq"]
 
     if args.sim_header == "tightTransf":
         args.loose_type = False

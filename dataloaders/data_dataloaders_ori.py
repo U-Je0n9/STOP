@@ -1,9 +1,6 @@
 # coding=utf-8
-import random
-from collections import defaultdict
-
 import torch
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_DataLoader
 from dataloaders.dataloader_msrvtt_retrieval import MSRVTT_TrainDataLoader
 from dataloaders.dataloader_activitynet_retrieval import ActivityNet_DataLoader
@@ -366,116 +363,6 @@ def dataloader_vatex_test(args, tokenizer, subset="test"):
     )
     return dataloader_msrvtt, len(vatex_testset)
 
-class NoRepeatBalancedBatchSampler(Sampler):
-    def __init__(self, labels, batch_size, num_classes=9, max_per_class=4, drop_last=True):
-        self.labels = list(map(int, labels))
-        self.batch_size = batch_size
-        self.num_classes = num_classes
-        self.max_per_class = max_per_class
-        self.drop_last = drop_last
-        self.epoch = 0
-
-        if batch_size < num_classes:
-            raise ValueError(
-                f"batch_size({batch_size}) must be >= num_classes({num_classes})."
-            )
-
-        if max_per_class * num_classes < batch_size:
-            raise ValueError(
-                f"max_per_class({max_per_class}) is too small for batch_size({batch_size}) "
-                f"and num_classes({num_classes})."
-            )
-
-        self.class_to_indices = defaultdict(list)
-        for idx, label in enumerate(self.labels):
-            self.class_to_indices[label].append(idx)
-
-        for c in range(num_classes):
-            if len(self.class_to_indices[c]) == 0:
-                raise ValueError(f"Class {c} has no samples.")
-
-        if drop_last:
-            self.num_batches = len(self.labels) // batch_size
-        else:
-            self.num_batches = (len(self.labels) + batch_size - 1) // batch_size
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-
-    def __iter__(self):
-        rng = random.Random(self.epoch)
-
-        pools = {}
-        for c in range(self.num_classes):
-            indices = self.class_to_indices[c].copy()
-            rng.shuffle(indices)
-            pools[c] = indices
-
-        while True:
-            total_remaining = sum(len(pools[c]) for c in range(self.num_classes))
-
-            if self.drop_last and total_remaining < self.batch_size:
-                break
-
-            if not self.drop_last and total_remaining == 0:
-                break
-
-            batch = []
-            batch_class_count = {c: 0 for c in range(self.num_classes)}
-
-            # 1) 가능한 한 모든 class에서 1개씩 먼저 뽑기
-            classes = list(range(self.num_classes))
-            rng.shuffle(classes)
-
-            for c in classes:
-                if len(batch) >= self.batch_size:
-                    break
-
-                if len(pools[c]) > 0:
-                    batch.append(pools[c].pop())
-                    batch_class_count[c] += 1
-
-            # class가 너무 적게 남아서 모든 class를 못 넣는 후반부면 중단
-            # 예: class 4만 남은 상태에서 batch 만드는 것 방지
-            active_classes = sum(1 for c in range(self.num_classes) if batch_class_count[c] > 0)
-            if active_classes < self.num_classes:
-                break
-
-            # 2) 남은 자리는 max_per_class 제한 안에서 채우기
-            while len(batch) < self.batch_size:
-                available = [
-                    c for c in range(self.num_classes)
-                    if len(pools[c]) > 0 and batch_class_count[c] < self.max_per_class
-                ]
-
-                # 중요:
-                # 여기서 max_per_class 제한을 풀면 후반에 [0,0,0,0,16,0,0,0,0] 같은 batch가 나옴.
-                # 그래서 제한을 풀지 않고 그냥 이 batch를 버림.
-                if len(available) == 0:
-                    break
-
-                weights = [len(pools[c]) for c in available]
-                c = rng.choices(available, weights=weights, k=1)[0]
-
-                batch.append(pools[c].pop())
-                batch_class_count[c] += 1
-
-            if len(batch) == self.batch_size:
-                rng.shuffle(batch)
-                yield batch
-            elif not self.drop_last and len(batch) > 0:
-                rng.shuffle(batch)
-                yield batch
-                break
-            else:
-                break
-
-    def __len__(self):
-        return self.num_batches
-
-    def set_epoch(self, epoch):
-        self.epoch = epoch
-        random.seed(epoch)
 
 def dataloader_direction_mcq_train(args, tokenizer):
     dataset = DirectionMCQ_DataLoader(
@@ -489,37 +376,22 @@ def dataloader_direction_mcq_train(args, tokenizer):
         slice_framepos=args.slice_framepos,
     )
 
-    labels = [int(item["label"]) for item in dataset.data]
-
-    class_counts = {}
-    for label in labels:
-        class_counts[label] = class_counts.get(label, 0) + 1
-
-    print(f"[balanced_batch_sampler] class_counts = {dict(sorted(class_counts.items()))}")
-
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        world_size = torch.distributed.get_world_size()
-        if world_size > 1:
-            raise NotImplementedError(
-                "NoRepeatBalancedBatchSampler is currently for single-GPU / single-rank training only."
-            )
-
-    batch_sampler = NoRepeatBalancedBatchSampler(
-        labels=labels,
-        batch_size=args.batch_size,
-        num_classes=9,
-        max_per_class=4,
-        drop_last=True,
-    )
+        train_sampler = torch.utils.data.distributed.DistributedSampler(dataset)
+    else:
+        train_sampler = None
 
     dataloader = DataLoader(
         dataset,
-        batch_sampler=batch_sampler,
+        batch_size=args.batch_size,
         num_workers=args.num_thread_reader,
         pin_memory=False,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
+        drop_last=True,
     )
 
-    return dataloader, len(dataset), batch_sampler
+    return dataloader, len(dataset), train_sampler
 
 
 def dataloader_direction_mcq_test(args, tokenizer, subset="test"):

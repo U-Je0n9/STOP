@@ -41,7 +41,8 @@ class DirectionMCQ_DataLoader(Dataset):
         self.max_words = max_words
         self.max_frames = max_frames
         self.class_texts = class_texts or DEFAULT_CLASS_TEXTS
-
+        self.frame_order = frame_order
+        self.slice_framepos = slice_framepos
         self.rawVideoExtractor = RawVideoExtractor(
             framerate=feature_framerate,
             size=224,
@@ -82,15 +83,49 @@ class DirectionMCQ_DataLoader(Dataset):
         )
 
     def _get_video(self, video_path):
-        # video_path가 absolute면 os.path.join은 video_path를 그대로 씀
         full_path = os.path.join(self.features_path, video_path)
 
-        video, video_mask = self.rawVideoExtractor.get_video_data(
+        raw_video_data = self.rawVideoExtractor.get_video_data(
             full_path,
             start_time=None,
             end_time=None,
-            max_frames=self.max_frames,
         )
+
+        raw_video_data = raw_video_data["video"]
+
+        # frame order 적용
+        raw_video_data = self.rawVideoExtractor.process_frame_order(
+            raw_video_data,
+            frame_order=self.frame_order,
+        )
+
+        # [T, C, H, W] -> [T, C, H, W]
+        video = np.zeros(
+            (self.max_frames, 3, self.rawVideoExtractor.size, self.rawVideoExtractor.size),
+            dtype=np.float32,
+        )
+        video_mask = np.zeros((self.max_frames,), dtype=np.int64)
+
+        if len(raw_video_data.shape) > 3:
+            slice_len = raw_video_data.shape[0]
+
+            # slice_framepos 처리: 원본 dataloader 방식
+            if self.slice_framepos == 0:
+                video_slice = raw_video_data[:self.max_frames]
+            elif self.slice_framepos == 1:
+                video_slice = raw_video_data[-self.max_frames:]
+            else:
+                sample_indx = np.linspace(
+                    0,
+                    slice_len - 1,
+                    num=min(self.max_frames, slice_len),
+                    dtype=int,
+                )
+                video_slice = raw_video_data[sample_indx]
+
+            slice_len = min(video_slice.shape[0], self.max_frames)
+            video[:slice_len] = video_slice[:slice_len]
+            video_mask[:slice_len] = 1
 
         return video, video_mask
 

@@ -309,7 +309,7 @@ class CLIP4Clip(CLIP4ClipPreTrainedModel):
         output_dict["logits"] = logits
 
         if labels is not None:
-            loss = F.cross_entropy(logits, labels)
+            loss = F.cross_entropy(logits, labels, label_smoothing=0.05)
             output_dict["loss"] = loss
             output_dict["sim_loss"] = loss
 

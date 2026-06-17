@@ -1,0 +1,19 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Logs
+logs/
+out_files/
+*.log
+*.out
+*.err
+
+# Models / pretrained weights
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt

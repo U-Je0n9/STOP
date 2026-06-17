@@ -476,6 +476,16 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
                 video_mask = video_mask.to(device=device, non_blocking=True)
                 labels = labels.to(device=device, non_blocking=True).long()
 
+            if is_master() and global_step % 50 == 0:
+                label_count = torch.bincount(labels.detach().cpu(), minlength=args.num_classes)
+                logging.info(
+                    "[batch_label_dist] "
+                    f"epoch={epoch} "
+                    f"step={step} "
+                    f"global_step={global_step} "
+                    f"counts={label_count.tolist()}"
+                )
+
             # class text는 모든 sample마다 동일하므로 첫 번째 것만 사용
             input_ids = input_ids[0]          # [9, max_words]
             input_mask = input_mask[0]        # [9, max_words]
@@ -517,7 +527,7 @@ def train_epoch(epoch, args, model, train_dataloader, device, optimizer, global_
                 if (
                     args.datatype == "direction_mcq"
                     and is_master()
-                    and global_step % 500 == 0
+                    and global_step % 100 == 0
                 ):
 
                     log_stats = summarize_direction_logits(
@@ -709,6 +719,7 @@ def eval_epoch_direction(model, test_dataloader, device, args=None, epoch=0):
                 video = video.to(device=device, non_blocking=True)
                 video_mask = video_mask.to(device=device, non_blocking=True)
                 labels = labels.to(device=device, non_blocking=True).long()
+
 
             input_ids = input_ids[0]
             input_mask = input_mask[0]
