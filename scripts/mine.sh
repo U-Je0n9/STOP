@@ -1,14 +1,4 @@
 #!/bin/bash
-#SBATCH --job-name=STOP_direction
-#SBATCH -o /nas2/data/wjddb1025/STOP/out_files/%j_%x.out
-#SBATCH -e /nas2/data/wjddb1025/STOP/out_files/%j_%x.err
-#SBATCH --partition=batch_ugrad
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:1
-#SBATCH --cpus-per-gpu=8
-#SBATCH --mem-per-gpu=32G
-#SBATCH --time=1-0
-#SBATCH --nodelist=ariel-v12
 
 set -e
 
@@ -17,22 +7,18 @@ echo "HOSTNAME: $(hostname)"
 echo "START TIME: $(date)"
 echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
 
-cd /nas2/data/wjddb1025/STOP
-
-source /nas2/data/wjddb1025/anaconda3/etc/profile.d/conda.sh
-conda activate STOP
 
 group=group2-2
 
 dataset=direction_mcq
 fps=3
 
-DATA_PATH=/local_datasets/STOP/4combo_v5/syn_shape_simple/videos_12f
-train_csv=/local_datasets/STOP/4combo_v5/syn_shape_simple/train.json
-val_csv=/local_datasets/STOP/4combo_v5/syn_shape_simple/val.json
-features_path=/local_datasets/STOP/4combo_v5/syn_shape_simple/videos_12f_compressed
+DATA_PATH=videos_12f
+train_csv=train.json
+val_csv=val.json
+features_path=videos_12f_compressed
 
-pretrained_dir=/nas2/data/wjddb1025/STOP/models/pretrained
+pretrained_dir=pretrained
 
 do_train=1
 do_eval=0
@@ -41,7 +27,7 @@ pretrained_clip_name=ViT-B/32
 lr=1e-3
 coef_lr=5e-4
 wd=0.2
-epochs=20
+epochs=8
 optim=AdamW
 max_words=32
 max_frames=12
@@ -99,7 +85,6 @@ python main.py \
     --use_traj_prompt 1 \
     --traj_prompt_scale 0.005 \
     --traj_prompt_dropout 0.0 \
-    --traj_feat_type patch_mean \
-    --resume /nas2/data/wjddb1025/STOP/logs/2026-06-16-01:32:43_direction_mcq_STOP/ckpt.best.pth.tar
+    --traj_feat_type patch_mean
 
 echo "Training Finished!!!"
