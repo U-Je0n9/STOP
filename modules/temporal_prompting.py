@@ -302,10 +302,10 @@ class TemporalPrompt_3(nn.Module):
 
         x = x.reshape(self.B, self.T, L, D)
 
-        # 방법 1: CLS token 기반 trajectory
+        # 방법 1: CLS 기반 trajectory
         # frame_feat = x[:, :, 0, :]             # [B, T, D]
 
-        # # 방법 2는 나중에 ablation용:
+        # 방법 2: token 기반
         frame_feat = x[:, :, 1:, :].mean(dim=2)  # [B, T, D]
 
         delta_h = frame_feat[:, 1:, :] - frame_feat[:, :-1, :]  # [B, T-1, D]
